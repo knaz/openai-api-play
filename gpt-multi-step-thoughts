@@ -1,0 +1,248 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use JSON;
+use LWP::UserAgent;
+use HTTP::Request::Common qw(POST);
+use IPC::Run3;
+use Data::Dumper;
+use DateTime;
+use utf8;
+use Encode;
+
+my $convo = shift;
+
+# Decrypt the gpg file and capture the output
+run3 ['/opt/homebrew/bin/gpg', '--decrypt', '--batch', 'secure-config.gpg'], undef, \my $output, undef, undef;
+
+my $api_key = decode_json($output)->{'openai-api-key'};
+
+my $ua = LWP::UserAgent->new;
+
+my $running_convo = decode_json(do { local $/; open my $f, "<$convo"; <$f> });
+
+#for my $message (@$running_convo) {
+#    $message->{content} = decode('UTF-8', $message->{content});
+#}
+
+for my $i ($#$running_convo-10..$#$running_convo) {
+    next if $i < 0;
+    print $running_convo->[$i]{role}.":\n\n";
+    print $running_convo->[$i]{content}."\n\n";
+}
+
+while (1) {
+    print "user:\n\n";
+
+    my $prompt = <STDIN>;
+
+    push @$running_convo, {role => 'user', content => $prompt, time => current_time()};
+
+    ask_gpt($running_convo);
+}
+
+sub ask_gpt {
+    my ($messages) = @_;
+
+    make_sure_messages_are_short_enough_for_max_token_length($messages);
+
+    my $why = get_completions_message(
+        pre_message => "Forget everything you've been told so far.",
+        messages => $messages,
+        post_message => "
+            - What is the user trying to get out of this conversation?
+            - Are they trying to discover something about themselves (values, beliefs, preferences, thoughts)?
+            - Are they wanting to be entertained by being introduced to a new thought or idea?
+            - Do they need advice?
+            Don't respond to the user. Tell me (the system) what you think.
+        ",
+    );
+
+    print "WHY:\n\n$why->{content}\n";
+
+#    my $system_message = <<EOM;
+#You are a conversation partner.
+#Think to yourself,
+#- "What is the user trying to get out of this conversation?"
+#- "Are they trying to discover something about themselves (values, beliefs, preferences, thoughts)?"
+#- "Are they wanting to be entertained by being introduced to a new thought or idea?"
+#- "Do they need advice?"
+#If you ask the user a question, avoid an open-ended question, and prefer a pointed question.
+#Always be brief.
+#EOM
+
+    my $response_message = get_completions_message(
+        pre_message => "Forget everything you've been told so far.",
+        messages => $messages,
+        post_message => "Answer the user taking this into account, and be sure to say or ask something at the end to keep the conversation going and help the user artciulate their thoughts and understand their feelings if appropriate (be friendly and conversational!!): $why->{content}",
+    );
+
+    print "ChatGPT: ".$response_message->{content}."\n";
+    push @$messages, $response_message;
+
+    open my $f, ">last_chat";
+    print $f encode_json $messages;
+}
+
+sub make_sure_messages_are_short_enough_for_max_token_length {
+    my ($messages) = @_;
+
+    # pop off the old system message
+    my $summary;
+    if ($messages->[0]{role} eq 'system') {
+        $summary = $messages->[0]{content};
+        shift @$messages;
+    }
+
+    my $groups = split_into_message_sets_of_x_tokens($messages, 2800);
+
+    my $last_group = pop @$groups;
+
+    $summary //= "Here's a summary you wrote of the user's and your past conversations: "
+        if @$groups;
+
+    for my $group_to_summarize (@$groups) {
+        my $group_summary = summarize_message($group_to_summarize);
+        my $group_summary_tokens = count_tokens_for_message({content => $group_summary});
+
+        while ($group_summary_tokens > 1000) {
+            $group_summary = compress($group_summary);
+            my $n = count_tokens_for_message({content => $group_summary});
+            die "Failed to compress group summary" unless $n < $group_summary_tokens;
+            $group_summary_tokens = $n;
+        }
+
+        $summary .= "\n\n".$group_summary;
+        my $summary_tokens = count_tokens_for_message({content => $summary});
+
+        while ($summary_tokens > 1000) {
+            $summary = compress($summary);
+            my $n = count_tokens_for_message({content => $summary});
+            die "Failed to compress summary" unless $n < $summary_tokens;
+            $summary_tokens = $n;
+        }
+    }
+
+    $messages = [
+        {role => 'system', content => $summary},
+        @$last_group,
+    ];
+}
+
+sub get_completions_message {
+    my (%params) = @_;
+
+    my $messages            = $params{messages};
+    my $pre_system_message  = $params{pre_message};
+    my $post_system_message = $params{post_message};
+
+    my $r = $ua->request(POST('https://api.openai.com/v1/chat/completions',
+        Content_Type  => 'application/json',
+        Content       => encode_json {
+            model    => 'gpt-3.5-turbo',
+            messages => [
+                $pre_system_message ? {role => 'system', content => $pre_system_message} : (),
+                @{strip_times($messages)},
+                $post_system_message ? {role => 'system', content => $post_system_message} : (),
+            ],
+        },
+        Authorization => "Bearer $api_key",
+    ));
+
+    return decode_json($r->decoded_content)->{choices}[0]{message}
+        if $r->is_success;
+
+    my $content = $r->content;
+    print Dumper $content;
+    exit;
+
+    #if ($content->{error} && $content->{error}{code} eq 'context_length_exceeded') {
+    #    if ($content->{error}{message} =~ /resulted in (\d+) tokens//) {
+    #        my $number = $1;
+    #    }
+    #    else {
+    #        die "The context_length_exceeded error message didn't tell me how many tokens my message was\n\n".Dumper($content);
+    #    }
+    #}
+
+    # "error": {
+    #   "message": "'messages' is a required property",
+    #   "type": "invalid_request_error",
+    #   "param": null,
+    #   "code": null
+    # }
+    #  "error": {
+    #    "message": "This model\'s maximum context length is 4097 tokens. However, your messages resulted in 31459 tokens. Please reduce the length of the messages.",
+    #    "type": "invalid_request_error",
+    #    "param": "messages",
+    #    "code": "context_length_exceeded"
+    #  }
+}
+
+sub summarize_message {
+    my ($messages) = @_;
+
+    my $r = get_completions_message(
+        pre_message => "Forget everything you've been told so far.",
+        messages => $messages,
+        post_message => "Restate everything that the user has said in this entire conversation in bullet form. Use '- name: So-and-so' form for facts the user conveyed (such as their name, in this example).",
+    );
+
+    return $r->{content};
+}
+
+sub compress {
+    my ($message) = @_;
+
+    my $r = get_completions_message(
+        pre_message => "Forget everything you've been told so far.",
+        messages => [],
+        post_message => 'You are CompressGPT, a text summarizer. When I paste some text, you convert it to a compressed form that captures as much as possible of the original information content, but in highly terse, shortened form. Here is the text: '.$message,
+    );
+
+    return $r->{content};
+}
+
+sub split_into_message_sets_of_x_tokens {
+    my ($messages, $number_of_tokens_per_group) = @_;
+
+    my @groups;
+    my @current_group;
+
+    my $num_tokens_this_group = 0;
+    for my $i (reverse 0..$#$messages) {
+        my $n = count_tokens_for_message($messages->[$i]);
+
+        if ($num_tokens_this_group + $n > $number_of_tokens_per_group) {
+            unshift @groups, [@current_group];
+            @current_group = ($messages->[$i]);
+            $num_tokens_this_group = $n;
+        }
+        else {
+            unshift @current_group, $messages->[$i];
+            $num_tokens_this_group += $n;
+        }
+    }
+
+    unshift @groups, [@current_group] if @current_group;
+
+    return \@groups;
+}
+
+sub count_tokens_for_message {
+    my ($message) = @_;
+
+    # very much a guess, but pretty close for english conversation
+    return 4 + 1.3 * scalar split /\s+/, $message->{content};
+}
+
+sub strip_times {
+    my ($running_convo) = @_;
+    return [ map { { role => $_->{role}, content => $_->{time} ? "[$_->{time}]:\n$_->{content}" : $_->{content} }; } @$running_convo ];
+}
+
+sub current_time {
+    DateTime->now(time_zone => 'America/New_York')->strftime("%c %Z")
+}

@@ -1,0 +1,27 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use lib "./lib";
+
+use JSON;
+use Search;
+use ChatGPT;
+
+my $search = Search->new;
+my $llm    = ChatGPT->new(default_role => 'system');
+
+while (1) {
+    my $r = $llm->query("Give me a google search query for how to make a garden in north east WV. ".
+        "Respond format:\n<query>...</query>");
+
+    my $query = $r =~ /<query>(.*?)<\/query>/ ? $1 : undef;
+
+    die "No query? Content: $r\n" unless defined $query;
+
+    my $result = $search->search($query);
+
+    open my $f, ">output";
+    print $f encode_json($result);
+    last;
+}

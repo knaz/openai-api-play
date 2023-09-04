@@ -1,0 +1,28 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use lib "./lib";
+
+use ChatGPT;
+use Conversation;
+
+my $llm          = ChatGPT->new;
+my $conversation = Conversation->load(shift);
+
+while (1) {
+    print "Type: ";
+    my $prompt = <STDIN>;
+
+    $conversation->add_prompt($prompt);
+
+    print "\nSending...\n\n";
+
+    my $r = $llm->query(messages => $conversation->messages);
+
+    $conversation->add_response($r);
+
+    print "ChatGPT: $r\n\n";
+
+    $conversation->save;
+}

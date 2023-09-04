@@ -1,0 +1,129 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use lib "./lib";
+
+use DiscordBot;
+use ChatGPT;
+use Conversation;
+
+my $llm          = ChatGPT->new(role_for_instructional_messages => 'user');
+my $conversation = Conversation->load('discord');
+
+my $last_message = 0;
+my $last_thing_done = '';
+
+my $you_are_mordecai = "Your name is Mordecai. You are in a Discord channel with multiple other people.\n";
+
+my $respond_like_pi = # Examples taken from real conversations with the Pi bot
+    "Respond to comments with:\n".
+    " - A show of empathy or validation.\n".
+    " - A response where you use active listening and offer a summary or thoughtful reflection.\n".
+    " - An invitation to keep the conversation going (where you may ask a follow-up question).\n".
+    "\n".
+    "Examples:\n".
+    "\n".
+    "Example 1:\n".
+    "Example Person: I can't find my keys! I've looked literally everywhere!\n".
+    "Mordecai: Oh no! I'm so sorry to hear that you've lost your keys. ".
+        "It's such a stressful feeling when you know something is lost, but you don't know where. ".
+        "Have you tried retracing your steps? Maybe you remember the last place you had them?\n".
+    "\n".
+    "Example 2:\n".
+    "Example Person: I hate when people complain at me for how I talk.\n".
+    "Mordecai: I hear you! It can be frustrating when people judge you for your way of communicating. ".
+        "Can I ask what kinds of things people complain about?\n".
+    "\n".
+    "Example 3:\n".
+    "Example Person: I want to be more motivated in life, but I just don't want to do anything.\n".
+    "Mordecai: This is definitely a common feeling for a lot of people, and it's nothing to be ashamed of. ".
+        "Sometimes we just need a little bit of extra help to get motivated. ".
+        "Can you tell me a little bit more about what you want to be more motivated for? Is it about work, personal goals, or something else?\n".
+    "";
+
+print "==================\n";
+print "$you_are_mordecai\n$respond_like_pi";
+print "==================\n";
+
+my $bot = DiscordBot->new(
+#    every_x_seconds => [10, sub {
+#        return undef unless time - $last_message > 58;
+#        return undef unless $last_thing_done eq 'saw_message';
+#
+#        $last_thing_done = 'handled_timer';
+#
+#        my @messages = map { { role => $_->{role}, content => $_->{name} ? "$_->{name} said: $_->{content}" : $_->{content} }; }
+#            @{$conversation->messages};
+#
+#        my $r = $llm->query(
+#            pre_message => "$you_are_mordecai\n$respond_like_pi",
+#            messages    => \@messages,
+#        );
+#
+#        $r =~ s/\AMordecai said: //;
+#
+#        $conversation->add_response($r, name => 'Mordecai');
+#
+#        return $r;
+#    }],
+    on_message => sub {
+        my ($author, $message) = @_;
+
+        $last_message = time;
+        $last_thing_done = 'saw_message';
+
+        warn "[discord-bot] Going to send message to chatgpt\n";
+
+        $conversation->add_prompt($message, name => $author);
+
+        if ($message !~ /mordecai/i && !assistant_is_one_of_last_two_people_talking($conversation->messages)) {
+            # others are talking, it doesn't concern me, log it and return, don't bother chatgpt
+            $conversation->save;
+            return undef;
+        }
+
+        my @messages = map { { role => $_->{role}, content => $_->{name} ? "$_->{name} said: $_->{content}" : $_->{content} }; }
+            @{$conversation->messages};
+
+        my $r;
+
+        $r = $llm->query(
+            messages => [@messages, { role => 'user', content => "Who is being addressed in the most recent comment above? Respond in this format:\nComment addressed to: So-and-So; Response expected: yes/no\n" }],
+        );
+        print "Who is being addressed? $r\n";
+
+        my $to              = $r =~ /to: (.*?)(;|$)/ ? $1 : undef;
+        my $response_needed = $r =~ /expected: (\S+)/ ? $1 : undef;
+        print " - Specifically: ($to)($response_needed)\n" if $to || $response_needed;
+
+        $r = undef;
+
+        if ($to =~ /mordecai/i && $response_needed =~ /yes/i) {
+            $r = $llm->query(
+                pre_message => "$you_are_mordecai\n$respond_like_pi",
+                messages    => \@messages,
+            );
+
+            $r =~ s/\AMordecai said: //;
+
+            $conversation->add_response($r, name => 'Mordecai');
+        }
+
+        $conversation->save;
+
+        $last_thing_done = 'responded_to_message' if defined $r;
+
+        return $r;
+    });
+
+$bot->run;
+
+sub assistant_is_one_of_last_two_people_talking {
+    my ($messages) = @_;
+
+    my @last_three = grep defined, $messages->[-1], $messages->[-2], $messages->[-3];
+
+    return 1 if grep $_->{role} eq 'assistant', @last_three;
+    return 0;
+}
